@@ -1,6 +1,6 @@
-# ICSA
+# CG
 
-This repository contains the temporal code used for the work with title 
-*Learning object representations through sequential amortized inference over probabilistic programs* submittes for the UAI 2025 conference.
+This repository contains the code used for the work with title 
+*Causal-CG: Exploiting causally disentangled representations for compositional generalization*.
 
 
