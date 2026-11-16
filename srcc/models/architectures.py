@@ -1,0 +1,821 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+from contextlib import nullcontext
+from typing import Any, Dict
+
+import sys
+sys.path.insert(0, '../..') # add parent-parent dir
+
+from srcc.main import params
+from srcc.utils.guide import permute_dims
+from srcc.utils.loss import compute_kl_loss, compute_matching_cost
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+import logging
+logger = logging.getLogger(params["running_type"])
+
+class View(nn.Module):
+    def __init__(self, size):
+        super(View, self).__init__()
+        self.size = size
+
+    def forward(self, tensor):
+        out = tensor.view(self.size)
+        return out
+
+def get_encoder(in_channels, out_dim):
+    """
+    Encoder f^{-1}: X -> Z; X - input image, Z - latent space.
+    """
+    modules_list = [
+        nn.Conv2d(in_channels, 32, 4, 2, 1),
+        nn.ELU(),
+        nn.Conv2d(32, 32, 4, 2, 1),
+        nn.ELU(),
+        nn.Conv2d(32, 32, 4, 2, 1),
+        nn.ELU(),
+        nn.Conv2d(32, 32, 4, 2, 1),
+        nn.ELU(),
+        View((-1, 32 * 4 * 4)),
+        nn.Linear(32 * 4 * 4, 256),
+        nn.ELU(),
+        nn.Linear(256, 256),
+        nn.ELU(),
+        nn.Linear(256, 128),
+        nn.ELU(),
+        nn.Linear(128, out_dim),
+    ]
+
+    encoder = nn.Sequential(*modules_list)
+    return encoder
+
+def get_decoder(in_dim, out_channels, add_sigmoid=False):
+    """
+    Decoder f: Z -> X; X - input image, Z - latent space.
+    """
+    module_list = [
+        nn.Linear(in_dim, 256),
+        nn.ELU(),
+        nn.Linear(256, 256),
+        nn.ELU(),
+        nn.Linear(256, 32 * 4 * 4),
+        nn.ELU(),
+        View((-1, 32, 4, 4)),
+        nn.ConvTranspose2d(32, 32, 4, 2, 1),
+        nn.ELU(),
+        nn.ConvTranspose2d(32, 32, 4, 2, 1),
+        nn.ELU(),
+        nn.ConvTranspose2d(32, 32, 4, 2, 1),
+        nn.ELU(),
+        nn.ConvTranspose2d(32, out_channels, 4, 2, 1),       
+    ]
+    if add_sigmoid:
+        module_list.append(nn.Sigmoid())
+
+    decoder = nn.Sequential(*module_list)
+    return decoder
+
+class iVAE(nn.Module):
+    def __init__(self, model_name, resolution, num_iterations, latent_dim, nlatents, A):
+        super().__init__()
+        self.resolution = resolution
+        self.num_slots = 0
+        self.num_iterations = num_iterations
+        self.L = nlatents
+        self.A = A
+        self.ldim = latent_dim
+        #self.slot_dim = self.L*self.ldim*4
+        self.slot_dim = self.L*self.ldim
+        self.model_name = model_name
+        self.cc = params["use_counterfactual_consistency"]
+        
+        self.encoder = FullNoiseEncoder(in_channels=3,
+                                        n_slots=params["num_slots"],
+                                        n_latents=self.L,
+                                        latent_dim=self.ldim,
+                                        stage=params["running_type"],
+                                        clamp_var=False)
+        self.scene_decoder = VAEAdditiveDecoder(in_channels=3, n_slots=params["num_slots"], n_latents=len(params["latent_vars"]), n_slot_latents=params["latent_dim"], add_sigmoid=False)
+        self.prior = ConditionalGaussianPrior(self.L, self.ldim, learn_var=True, clamp_var=False)
+        self.predictor = Predictor(self.slot_dim, self.slot_dim, self.L)
+                
+        self.epoch = 0
+        self.iter = 0
+        
+    
+    def intervention(self, z):
+        B, N, _, _ = z.shape
+        z0, z1, z2, z3 = torch.split(torch.flatten(z, -2), params["latent_dim"], -1)
+
+        flag = torch.distributions.Categorical(
+            torch.tensor([1/len(params["latent_vars"]) for _ in range(len(params["latent_vars"]))])
+            ).sample()
+        
+        if flag == 0:
+            z0_int, self.perm = permute_dims(torch.flatten(z0, 0, 1), z0.size(-1))
+            z0_int = z0_int.view(B, N, -1)
+            z_int = torch.cat((z0_int.unsqueeze(-2),
+                                    z1.unsqueeze(-2),
+                                    z2.unsqueeze(-2),
+                                    z3.unsqueeze(-2)), dim=-2)
+        elif flag == 1:
+            z1_perm, self.perm = permute_dims(torch.flatten(z1, 0, 1), z1.size(-1))
+            z1_int = z1_perm.view(B, N, -1)
+            z_int = torch.cat((z0.unsqueeze(-2),
+                                    z1_int.unsqueeze(-2),
+                                    z2.unsqueeze(-2),
+                                    z3.unsqueeze(-2)), dim=-2)
+        elif flag == 2:
+            z2_perm, self.perm = permute_dims(torch.flatten(z2, 0, 1), z2.size(-1))
+            z2_int = z2_perm.view(B, N, -1)
+            z_int = torch.cat((z0.unsqueeze(-2),
+                                    z1.unsqueeze(-2),
+                                    z2_int.unsqueeze(-2),
+                                    z3.unsqueeze(-2)), dim=-2)
+        elif flag == 3:
+            z3_perm, self.perm = permute_dims(torch.flatten(z3, 0, 1), z2.size(-1))
+            z3_int = z3_perm.view(B, N, -1)
+            z_int = torch.cat((z0.unsqueeze(-2),
+                                    z1.unsqueeze(-2),
+                                    z2.unsqueeze(-2),
+                                    z3_int.unsqueeze(-2)), dim=-2)
+        return z_int
+
+    def forward(self, img, labels, step=0):
+
+        B, _, _, _ = img.shape
+        n_s = params['num_slots'] 
+
+        assert labels.shape == (B, n_s, self.L), f"{labels.shape}"
+
+        mu_z, logvar_z, z_scm = self.encoder(img)
+        
+        # get initial predictions and aligned labels
+        mu_z_d = mu_z.detach()
+        preds = self.predictor(mu_z_d)
+        self.z_preds = preds
+        if torch.isnan(preds).any():
+            logger.info(torch.isnan(img).any())
+            for name, param in self.encoder.named_parameters():
+                logger.info(f"\n{name} - {param}")
+            logger.info(f"mu_z: {mu_z_d}")
+            logger.info(f"logvar_z: {logvar_z}")        
+        self.pred_loss, aligned_u_m = compute_matching_cost(preds, labels)
+        
+        # get latent-wise distributions
+        mu_z = mu_z.reshape(mu_z.size(0), mu_z.size(1), self.L, self.ldim)
+        logvar_z = logvar_z.reshape(logvar_z.size(0), logvar_z.size(1), self.L, self.ldim)
+        z_scm = z_scm.reshape(z_scm.size(0), z_scm.size(1), self.L, self.ldim)             
+        # get noise and causal priors
+        self.mu_prior, self.logvar_prior = self.prior(aligned_u_m)
+        img_hat, recon_figures = self.scene_decoder(z_scm)
+
+        if params["running_type"] == "eval": 
+            return z_scm, img_hat, recon_figures
+
+        return img_hat, z_scm, mu_z, logvar_z, recon_figures
+
+class VAE(nn.Module):
+    def __init__(self, num_slots, L, ldim, stage):
+        super().__init__()
+        self.L = L
+        self.ldim = ldim
+        self.encoder = FullNoiseEncoder(in_channels=3,
+                                        n_slots=num_slots,
+                                        n_latents=L,
+                                        latent_dim=ldim,
+                                        stage=stage,
+                                        clamp_var=False)
+
+        self.decoder = VAEAdditiveDecoder(in_channels=3,
+                                          n_slots=num_slots,
+                                          n_latents=L,
+                                          n_slot_latents=ldim,
+                                          add_sigmoid=False
+                                          )
+
+    def forward(self, x):
+        mean, logvar, z = self.encoder(x)
+        
+        mean = mean.reshape(mean.size(0), mean.size(1), self.L, self.ldim)
+        logvar = logvar.reshape(logvar.size(0), logvar.size(1), self.L, self.ldim)
+        z = z.reshape(z.size(0), z.size(1), self.L, self.ldim) 
+
+        img_hat, recon_figures = self.decoder(z)
+        return img_hat, recon_figures, mean, logvar, z
+
+    def compute_recon_loss(self, x_hat, x):
+        return F.mse_loss(x_hat, x)
+
+    def compute_kl_div(self, mu, logvar):
+        assert len(mu.shape) == 4
+        mu = torch.flatten(torch.flatten(mu, 0, 1), -2)
+        logvar = torch.flatten(torch.flatten(logvar, 0, 1), -2)
+        return compute_kl_loss(mu, logvar)
+    
+class VAEAdditiveDecoder(torch.nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        n_slots: int,
+        n_latents: int,
+        n_slot_latents: int,
+        add_sigmoid: bool,
+    ) -> None:
+        super(VAEAdditiveDecoder, self).__init__()
+        self.n_slots = n_slots
+        self.n_slot_latents = n_slot_latents
+        
+        self.decoder = get_decoder(n_latents*n_slot_latents, 3, add_sigmoid)
+
+    def forward(self, latents):
+        batch_size, n_slots, n_features, features = latents.size()
+        reshaped_latents = latents.view(batch_size * n_slots, n_features, features)
+        H, W = params["resolution"]
+        
+        z = torch.flatten(reshaped_latents, -2)
+        
+        # Pass reshaped latents through decoder
+        reshaped_figures = self.decoder(z)
+        # Reshape figures back to [batch_size, n_slots, ...]
+        figures = reshaped_figures.view(
+            batch_size, n_slots, *reshaped_figures.shape[1:]
+        )
+        # Sum over the n_slots dimension for image  
+        image = figures.sum(dim=1)
+        return image, figures
+
+class ConstrainedSlotMLPAdditiveDecoder(torch.nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        n_slots: int,
+        n_slot_latents: int,
+    ) -> None:
+        super(ConstrainedSlotMLPAdditiveDecoder, self).__init__()
+        self.n_slots = n_slots
+        self.n_slot_latents = n_slot_latents
+        
+        self.app_decoder = nn.Sequential(
+            nn.Conv2d(self.n_slot_latents + 2, 64, kernel_size=3, padding=1), # 6
+            nn.ELU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ELU(),
+            nn.Conv2d(64, 3, kernel_size=3, padding=1),
+        )
+        self.geom_decoder = nn.Sequential(
+            nn.Conv2d(2, 64, kernel_size=3, padding=1),
+            nn.ELU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ELU(),
+            nn.Conv2d(64, 1, kernel_size=3, padding=1),
+            nn.Sigmoid()
+        )
+        self.model_name = "SlotMLPAdditiveDecoder"
+
+    def forward(self, latents):
+        # Reshape latents from [batch_size, n_slots, features] to [batch_size*n_slots, features]
+        batch_size, n_slots, n_features, features = latents.size()
+        reshaped_latents = latents.view(batch_size * n_slots, n_features, features)
+        H, W = params["resolution"]
+        
+        z_color = torch.flatten(reshaped_latents[:, 1:2], -2)
+        z_scale = torch.flatten(reshaped_latents[:, 0:1], -2)
+        z_x = reshaped_latents[:, 2:3]
+        z_y = reshaped_latents[:, 3:4]
+
+        z_color = z_color.view(z_color.shape + (1, 1))
+        z_color = z_color.expand((-1, -1, H, W))
+        
+        #z_scale = 0.3 + 0.7*torch.sigmoid(z_scale)
+        z_scale = torch.sigmoid(z_scale)
+        tx = 2. * torch.sigmoid(z_x) - 1.
+        ty = 2. * torch.sigmoid(z_y) - 1.
+        
+        x = torch.linspace(-1, 1, W).to(device)
+        y = torch.linspace(-1, 1, H).to(device)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+
+        x_grid = xx.view((1, 1) + xx.shape)
+        y_grid = yy.view((1, 1) + yy.shape)
+        
+        z_color_grid = torch.cat((x_grid.expand(batch_size * n_slots, -1, -1, -1),
+                                y_grid.expand(batch_size * n_slots, -1, -1, -1), z_color), dim=1)
+
+        x_local = (xx - tx[:, :, None]) / (z_scale[:, :, None, None] + 1e-3)
+        y_local = (yy - ty[:, :, None]) / (z_scale[:, :, None, None] + 1e-3)
+        coords = torch.cat([x_local, y_local], dim=1)
+
+        app_figure = self.app_decoder(z_color_grid)
+        geom_figure = self.geom_decoder(coords)
+        
+        # Pass reshaped latents through decoder
+        reshaped_figures = app_figure * geom_figure
+        
+        app_figure = app_figure.view(
+            batch_size, n_slots, *reshaped_figures.shape[1:]
+        )
+        geom_figure = geom_figure.view(
+            batch_size, n_slots, 1, *reshaped_figures.shape[2:]
+        )
+
+        # Reshape figures back to [batch_size, n_slots, ...]
+        figures = reshaped_figures.view(
+            batch_size, n_slots, *reshaped_figures.shape[1:]
+        )
+        # Sum over the n_slots dimension for image  
+        image = figures.sum(dim=1)
+        return image, figures, app_figure, geom_figure
+
+    
+class FullNoiseEncoder(nn.Module):
+    def __init__(self, in_channels, n_slots, n_latents, latent_dim, stage="train", clamp_var=False):
+        super().__init__()
+
+        self.stage = stage
+        self.clamp_var = clamp_var
+        out_dim = n_slots * n_latents * latent_dim
+        # out_dim = n_slots * latent_dim
+        modules_list = [
+            nn.Conv2d(in_channels, 32, 4, 2, 1),
+            nn.ELU(),
+            nn.Conv2d(32, 32, 4, 2, 1),
+            nn.ELU(),
+            nn.Conv2d(32, 32, 4, 2, 1),
+            nn.ELU(),
+            nn.Conv2d(32, 32, 4, 2, 1),
+            nn.ELU(),
+            View((-1, 32 * 4 * 4)),
+            nn.Linear(32 * 4 * 4, 256),
+            nn.ELU(),
+            nn.Linear(256, 256),
+            nn.ELU(),
+            nn.Linear(256, 128),
+            nn.ELU(),
+            ]
+
+        self.encoder = nn.Sequential(*modules_list)
+        self.n_latents = n_latents
+        self.latent_dim = latent_dim
+        self.n_slots = n_slots
+        self.fc_mean = nn.Linear(128, out_dim)
+        self.fc_logvar = nn.Linear(128, out_dim)
+
+    def encode(self, x):
+        x = self.encoder(x)
+        assert not torch.isnan(x).any()
+
+        mean = self.fc_mean(x).view(-1, self.n_slots, self.n_latents*self.latent_dim)
+        logvar = self.fc_logvar(x).view(-1, self.n_slots, self.n_latents*self.latent_dim)
+        return mean, logvar
+
+    def forward(self, x):
+        mean, logvar = self.encode(x)
+        stds = torch.exp(0.5*logvar)
+        z = mean + torch.randn_like(mean)*stds
+        return mean, logvar, z
+
+class MLP(nn.Module):
+    def __init__(self, nin, nout, nh, f_act="identity"):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(nin, nh),
+            nn.Softplus(),
+            nn.Linear(nh, nh),
+            nn.Softplus(),
+            nn.Linear(nh, nh),
+            nn.Softplus(),
+            nn.Linear(nh, nout),
+        )
+
+
+    def forward(self, x, mask=None):
+        return self.net(x)
+        
+class Predictor(nn.Module):
+    def __init__(self, nin, nhidden, nout):
+        super().__init__()
+        
+        nhidden = nin*4
+        self.net = nn.Sequential(
+            nn.Linear(nin, nhidden),
+            nn.ELU(),
+            nn.Linear(nhidden, nhidden),
+            nn.ELU(),
+            nn.Linear(nhidden, nout),
+        )
+
+    def forward(self, x):
+        B, N, d = x.shape
+        out = self.net(x)
+        return out
+
+class Probe(nn.Module):
+    def __init__(self, nin, nhidden, nout):
+        super().__init__()
+        
+        self.net = nn.Sequential(
+            nn.Linear(nin, nhidden),
+            nn.ReLU(),
+            nn.Linear(nhidden, nhidden),
+            nn.ReLU(),
+            nn.Linear(nhidden, nout),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        B, N, d = x.shape
+        out = self.net(x)
+        return out
+
+
+class Flow(nn.Module):
+    def __init__(self, L, ldim, A=None, net_class=MLP, nh=100, f_act="identity"):
+        super().__init__()
+
+        self.s_cond = net_class(L*ldim, ldim, ldim, f_act=f_act)
+        self.t_cond = net_class(L*ldim, ldim, ldim, f_act="identity")
+        self.total_dims = L*ldim
+        
+        self.L, self.ldim = L, ldim
+
+    def forward(self, eps, z, mask):
+        B, n_s, _ = eps.shape
+
+        s = self.s_cond(z.reshape(-1, self.total_dims), mask).reshape(B, n_s, self.ldim) # slope
+        t = self.t_cond(z.reshape(-1, self.total_dims), mask).reshape(B, n_s, self.ldim) # offset
+        
+        if torch.isnan(s).any():
+            for name, param in self.s_cond.named_parameters():
+                logger.info(f"{name} - {torch.isnan(param).any()}")
+
+        assert not torch.isnan(s).any()
+        assert not torch.isnan(t).any()
+
+        # s = s - s.mean(dim=-1, keepdim=True)
+        
+        z_i = torch.exp(s) * eps + t
+        return z_i, s, t
+        
+class MultivariateCausalFlow(nn.Module):
+    def __init__(self, L, ldim, A, stage="train"):
+        super().__init__()
+        
+        self.s_base = nn.Parameter(torch.randn(1, 1, ldim), requires_grad=True)
+        self.t_base = nn.Parameter(torch.randn(1, 1, ldim), requires_grad=True)
+
+        self.s2_base = nn.Parameter(torch.randn(1, 1, ldim), requires_grad=True)
+        self.t2_base = nn.Parameter(torch.randn(1, 1, ldim), requires_grad=True)
+
+        self.s3_base = nn.Parameter(torch.randn(1, 1, ldim), requires_grad=True)
+        self.t3_base = nn.Parameter(torch.randn(1, 1, ldim), requires_grad=True)
+
+        self.s_cond = MLP(ldim, ldim, ldim*4)
+        self.t_cond = MLP(ldim, ldim, ldim*4)
+
+        self.stage = stage
+        self.scale_gain = 1.
+        self.shift_gain = 1.
+        
+
+    def forward(self, eps, epoch=0, use_cc=False, debug=False):        
+        
+        B, N, _, _ = eps.shape
+
+        s0 = self.s_base.expand(B, N, -1)
+        t0 = self.t_base.expand(B, N, -1)
+        z0 = torch.exp(s0)*eps[:, :, 0, :] + t0
+          
+        s1 = self.s_cond(z0) * self.scale_gain
+        t1 = self.t_cond(z0) * self.shift_gain
+        z1 = torch.exp(s1)*eps[:, :, 1, :] + t1
+
+        s2 = self.s2_base.expand(B, N, -1)
+        t2 = self.t2_base.expand(B, N, -1)
+        z2 = torch.exp(s2)*eps[:, :, 2, :] + t2
+
+        s3 = self.s3_base.expand(B, N, -1)
+        t3 = self.t3_base.expand(B, N, -1)
+        z3 = torch.exp(s3)*eps[:, :, 3, :] + t3
+
+        if debug:
+            logger.info(f"\ns0: {s0[0, 0]}")
+            logger.info(f"t0: {t0[0, 0]}")
+            logger.info(f"z0: {z0}")
+
+            logger.info(f"\ns1: {s1}")
+            logger.info(f"t1: {t1}")
+            logger.info(f"z1: {z1}")
+
+            logger.info(f"\ns2: {s2[0, 0]}")
+            logger.info(f"t2: {t2[0, 0]}")
+            logger.info(f"z2: {z2}")
+
+            logger.info(f"\ns3: {s3[0, 0]}")
+            logger.info(f"t3: {t3[0, 0]}")
+            logger.info(f"z3: {z3}")
+
+        z = torch.cat((z0.unsqueeze(-2),
+                        z1.unsqueeze(-2),
+                        z2.unsqueeze(-2),
+                        z3.unsqueeze(-2)), dim=-2)
+        ss = torch.cat((s0.unsqueeze(-2),
+                        s1.unsqueeze(-2),
+                        s2.unsqueeze(-2),
+                        s3.unsqueeze(-2)), dim=-2)
+        ts = torch.cat((t0.unsqueeze(-2),
+                        t1.unsqueeze(-2),
+                        t2.unsqueeze(-2),
+                        t3.unsqueeze(-2)), dim=-2)   
+
+        log_det = torch.sum(s0, dim=-1) + torch.sum(s1, dim=-1) + torch.sum(s2, dim=-1) + torch.sum(s3, dim=-1)
+        log_det = torch.mean(log_det)       
+
+        return z, ss, ts, log_det
+
+    def intervention(self, eps, z, flag=None):
+        B, N, _, _ = z.shape
+
+        z0, z1, z2, z3 = torch.split(torch.flatten(z, -2), params["latent_dim"], -1)
+
+        self.flag = torch.distributions.Categorical(
+            torch.tensor([1/len(params["latent_vars"]) for _ in range(len(params["latent_vars"]))])
+            ).sample() if flag == None else flag
+        
+        # z1 is [B, N, d]
+        
+        if self.flag == 0:
+            z0_int, self.perm = permute_dims(torch.flatten(z0, 0, 1), z0.size(-1))
+            z0_int = z0_int.view(B, N, -1)
+            
+            s1_int = self.s_cond(z0_int) * self.scale_gain
+            t1_int = self.t_cond(z0_int) * self.shift_gain
+            z1_int = torch.exp(s1_int)*eps[:, :, 1, :] + t1_int
+
+            self.z_int = torch.cat((z0_int.unsqueeze(-2),
+                                    z1_int.unsqueeze(-2),
+                                    z2.unsqueeze(-2),
+                                    z3.unsqueeze(-2)), dim=-2)
+            
+        elif self.flag == 1:
+            z1_perm, self.perm = permute_dims(torch.flatten(z1, 0, 1), z1.size(-1))
+            z1_int = z1_perm.view(B, N, -1)
+            self.z_int = torch.cat((z0.unsqueeze(-2),
+                                    z1_int.unsqueeze(-2),
+                                    z2.unsqueeze(-2),
+                                    z3.unsqueeze(-2)), dim=-2)
+        
+        elif self.flag == 2:
+            z2_perm, self.perm = permute_dims(torch.flatten(z2, 0, 1), z2.size(-1))
+            z2_int = z2_perm.view(B, N, -1)
+            self.z_int = torch.cat((z0.unsqueeze(-2),
+                                    z1.unsqueeze(-2),
+                                    z2_int.unsqueeze(-2),
+                                    z3.unsqueeze(-2)), dim=-2)
+        
+        elif self.flag == 3:
+            z3_perm, self.perm = permute_dims(torch.flatten(z3, 0, 1), z2.size(-1))
+            z3_int = z3_perm.view(B, N, -1)
+            self.z_int = torch.cat((z0.unsqueeze(-2),
+                                    z1.unsqueeze(-2),
+                                    z2.unsqueeze(-2),
+                                    z3_int.unsqueeze(-2)), dim=-2)
+        
+        return self.z_int, self.flag
+
+    def counterfactuals(self, eps, z, flag=None):
+            
+        B, N, _, _ = z.shape
+
+        z0, z1, z2, z3 = torch.split(torch.flatten(z, -2), params["latent_dim"], -1)
+
+        self.flag = torch.distributions.Categorical(
+            torch.tensor([1/len(params["latent_vars"]) for _ in range(len(params["latent_vars"]))])
+            ).sample() if flag == None else flag
+        
+        # z1 is [B, N, d]
+        
+        if self.flag == 0:
+            z0_int, self.perm = permute_dims(torch.flatten(z0, 0, 1), z0.size(-1))
+            z0_int = z0_int.view(B, N, -1)
+            
+            s1_int = self.s_cond(z0_int) * self.scale_gain
+            t1_int = self.t_cond(z0_int) * self.shift_gain
+            z1_int = torch.exp(s1_int)*eps[:, :, 1, :] + t1_int
+
+            self.z_int = torch.cat((z0_int.unsqueeze(-2),
+                                    z1_int.unsqueeze(-2),
+                                    z2.unsqueeze(-2),
+                                    z3.unsqueeze(-2)), dim=-2)
+            
+            eps0_int = (z0_int - self.t_base.expand(B, N, -1)) * torch.exp(-self.s_base.expand(B, N, -1))
+            self.eps_int = torch.cat((eps0_int.unsqueeze(-2), eps[:, :, 1:]), dim=-2)
+
+        elif self.flag == 1:
+            z1_perm, self.perm = permute_dims(torch.flatten(z1, 0, 1), z1.size(-1))
+            z1_perm = z1_perm.view(B, N, -1)
+            z0_perm = torch.flatten(z0, 0, 1)[self.perm]
+            z0_perm = z0_perm.view(B, N, -1)
+            s1_int = self.s_cond(z0_perm) * self.scale_gain
+            t1_int = self.t_cond(z0_perm) * self.shift_gain
+            e1_int = (z1_perm - t1_int) * torch.exp(-s1_int)
+            
+            z1_int = torch.exp(self.s_cond(z0) * self.scale_gain) * e1_int + self.t_cond(z0) * self.shift_gain
+
+            self.z_int = torch.cat((z0.unsqueeze(-2),
+                                    z1_int.unsqueeze(-2),
+                                    z2.unsqueeze(-2),
+                                    z3.unsqueeze(-2)), dim=-2)
+            
+            eps1_int = (z1_int - self.t_cond(z1)*self.shift_gain) * torch.exp(-self.s_cond(z1) * self.scale_gain)
+            self.eps_int = torch.cat((eps[:, :, 0].unsqueeze(-2), eps1_int.unsqueeze(-2), eps[:, :, 2:]), dim=-2)
+
+        elif self.flag == 2:
+            z2_int, self.perm = permute_dims(torch.flatten(z2, 0, 1), z2.size(-1))
+            z2_int = z2_int.view(B, N, -1)
+            self.z_int = torch.cat((z0.unsqueeze(-2),
+                                    z1.unsqueeze(-2),
+                                    z2_int.unsqueeze(-2),
+                                    z3.unsqueeze(-2)), dim=-2)
+            eps2_int = (z2_int - self.t2_base.expand(B, N, -1)) * torch.exp(-self.s2_base.expand(B, N, -1))
+            self.eps_int = torch.cat((eps[:, :, :2], eps2_int.unsqueeze(-2), eps[:, :, -1].unsqueeze(-2)), dim=-2)
+        
+        elif self.flag == 3:
+            z3_int, self.perm = permute_dims(torch.flatten(z3, 0, 1), z3.size(-1))
+            z3_int = z3_int.view(B, N, -1)
+            self.z_int = torch.cat((z0.unsqueeze(-2),
+                                    z1.unsqueeze(-2),
+                                    z2.unsqueeze(-2),
+                                    z3_int.unsqueeze(-2)), dim=-2)
+            eps3_int = (z3_int - self.t3_base.expand(B, N, -1)) * torch.exp(-self.s3_base.expand(B, N, -1))
+            self.eps_int = torch.cat((eps[:, :, :3], eps3_int.unsqueeze(-2)), dim=-2)
+        
+        return self.z_int, self.eps_int, self.flag
+        
+ 
+    def backward(self, z, flag=None, no_flow=False):
+
+        B, N, _, d = z.shape
+        
+        if no_flow:
+            ss = torch.zeros_like(z)
+            ts = torch.zeros_like(z)
+            log_det = 0.
+            return z, ss, ts, log_det
+
+        if flag == None:
+            s0 = self.s_base.expand(B, N, -1)
+            t0 = self.t_base.expand(B, N, -1)
+            e0 = (z[:, :, 0] - t0) * torch.exp(-s0)
+
+            s1 = self.s_cond(z[:, :, 0]) * self.scale_gain
+            t1 = self.t_cond(z[:, :, 0]) * self.shift_gain
+            e1 = (z[:, :, 1] - t1) * torch.exp(-s1)
+
+            s2 = self.s_base.expand(B, N, -1)
+            t2 = self.t_base.expand(B, N, -1)
+            e2 = (z[:, :, 2] - t2) * torch.exp(-s2)
+
+            s3 = self.s_base.expand(B, N, -1)
+            t3 = self.t_base.expand(B, N, -1)
+            e3 = (z[:, :, 3] - t3) * torch.exp(-s3)
+
+            log_det = torch.sum(s0, dim=-1) + torch.sum(s1, dim=-1) + torch.sum(s2, dim=-1) + torch.sum(s3, dim=-1)
+            log_det = torch.mean(log_det) 
+
+            e = torch.cat((e0.unsqueeze(-2),
+                           e1.unsqueeze(-2),
+                           e2.unsqueeze(-2),
+                           e3.unsqueeze(-2)), dim=-2)
+            
+            ss = torch.cat((s0.unsqueeze(-2),
+                        s1.unsqueeze(-2),
+                        s2.unsqueeze(-2),
+                        s3.unsqueeze(-2)), dim=-2)
+            ts = torch.cat((t0.unsqueeze(-2),
+                        t1.unsqueeze(-2),
+                        t2.unsqueeze(-2),
+                        t3.unsqueeze(-2)), dim=-2) 
+            
+            return e, ss, ts, log_det
+   
+        elif flag == 0:
+            
+            # z = [z0_int, z1_int, z2, z3]
+
+            s0 = self.s_base.expand(B, N, -1)
+            t0 = self.t_base.expand(B, N, -1)
+            e0_int = (z[:, :, 0] - t0) * torch.exp(-s0)
+
+            return e0_int
+
+        elif flag == 1:
+            # here we have to get the z_scale that took the influence on z_color 
+            # because in this case, z_scale and z_color will have a different order
+
+            # z = [z0, z1_int, z2, z3]
+            
+            z0_perm = torch.flatten(z[:, :, 0], 0, 1)[self.perm]
+            assert z0_perm.shape == (B*N, d), f"{z0_perm.shape}"
+            
+            s1 = self.s_cond(z0_perm.view(B, N, -1)) * self.scale_gain
+            t1 = self.t_cond(z0_perm.view(B, N, -1)) * self.shift_gain
+            e1_int = (z[:, :, 1] - t1) * torch.exp(-s1)
+            return e1_int    
+    
+        else: raise ValueError(f"invalid flag {flag}...")
+    
+class GaussianMLP(nn.Module):
+    def __init__(self, nin, nout, nh, learn_var, alpha, beta):
+        super().__init__()
+        self.learn_var = learn_var
+        
+        self.mean_head = nn.Linear(nin, nout)
+        if learn_var: self.logvar_head = nn.Linear(nin, nout)
+
+        self.alpha = alpha
+        self.beta = beta
+        self.nout = nout
+
+    def forward(self, x):
+        mean = self.alpha * self.mean_head(x)
+        if self.learn_var: logvar = self.beta * self.logvar_head(torch.square(x))
+        else: logvar = torch.zeros_like(mean)
+        return mean, logvar
+        
+class ConditionalGaussianPrior(nn.Module):
+    def __init__(self, L, ldim, learn_var=False, clamp_var=False):
+        super().__init__()
+        self.learn_var = learn_var
+        self.clamp_var = clamp_var
+        self.L = L
+        self.net = nn.ModuleDict()
+        alpha = [1., 1., 1., 1.] 
+        beta = [1., 1., 1., 1.]
+        self.freq_coeff = []
+        for i in range(self.L):
+            slope = 0.01 
+            freq = (i - 6) * np.pi
+            self.freq_coeff.append(freq)
+            self.net[str(i)] = GaussianMLP(1, 1, 32, learn_var, alpha[i], beta[i])
+
+    def forward(self, labels):
+
+        B, N, _ = labels.shape
+        means, logvars = [], []
+        for i in range(self.L):
+            out = self.net[str(i)](labels[:, :, i].unsqueeze(-1))
+            
+            assert isinstance(out, tuple)
+            mean, logvar = out[0], out[1]
+            
+            if self.clamp_var:
+                logvar = torch.clamp(logvar, -2., 2.)
+            means.append(mean)   
+            logvars.append(logvar)       
+        means = torch.stack(means, -2)
+        logvars = torch.stack(logvars, -2) - 3. 
+        return means, logvars
+    
+class CausalGaussianPrior(nn.Module):
+    def __init__(self, L, ldim, A):
+        super().__init__()
+        self.L = L
+        self.A = A
+        self.net = nn.ModuleDict()
+        alpha = [1., 1., 1., 1.]
+        beta = [1., 1., 1., 1.]
+        self.freq_coeff = []
+        for i in range(self.L):
+            freq = (i - 6) * np.pi
+            self.freq_coeff.append(freq)
+            
+            self.net[str(i)] = GaussianMLP(nin=ldim + 1, nout=ldim, nh=ldim*4, learn_var=True,
+                                            alpha=alpha[i], beta=beta[i])
+
+    def forward(self, labels, z):
+
+        means, logvars = [], []
+        for i in range(self.L):
+            if 1 in self.A[i, :]:
+                parent = (self.A[i, :] == 1).nonzero(as_tuple=False).item() # index of parent
+                pa_zi = z[:, :, parent]
+            else:
+                pa_zi = torch.zeros_like(z[:, :, 0]).to(device)
+            zu_i = torch.cat((pa_zi, labels[:, :, i].unsqueeze(-1)), dim=-1)
+            out = self.net[str(i)](zu_i)
+            
+            assert isinstance(out, tuple)
+            mean, logvar = out[0], out[1]
+            logvar = -torch.nn.functional.softplus(logvar) - 1.
+
+            means.append(mean)   
+            logvars.append(logvar)       
+        means = torch.stack(means, -2)
+        logvars = torch.stack(logvars, -2) 
+        return means, logvars
